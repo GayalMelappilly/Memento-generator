@@ -5,6 +5,7 @@ import { TemplateData, LayoutConfig, Student } from "@/types";
 import TemplateUpload from "@/components/TemplateUpload";
 import CalibrationStage from "@/components/CalibrationStage";
 import DataUpload from "@/components/DataUpload";
+import AutoCorrectStage from "@/components/AutoCorrectStage";
 import PreviewPane from "@/components/PreviewPane";
 import BatchGenerator from "@/components/BatchGenerator";
 import { RefreshCcw, ArrowRight } from "lucide-react";
@@ -55,15 +56,16 @@ export default function Home() {
         </header>
 
         {/* Stepper indicators */}
-        <div className="flex gap-2 mb-8 max-w-2xl mx-auto">
-          {[1, 2, 3, 4].map(s => (
+        <div className="flex gap-2 mb-8 max-w-3xl mx-auto">
+          {[1, 2, 3, 4, 5].map(s => (
             <div key={s} className="flex-1">
               <div className={`h-2 rounded-full ${s <= step ? 'bg-blue-600' : 'bg-gray-200'}`} />
               <div className={`text-xs mt-1 text-center font-medium ${s <= step ? 'text-blue-600' : 'text-gray-400'}`}>
                 {s === 1 && "Template"}
                 {s === 2 && "Calibrate"}
                 {s === 3 && "Data"}
-                {s === 4 && "Generate"}
+                {s === 4 && "AI Correct"}
+                {s === 5 && "Generate"}
               </div>
             </div>
           ))}
@@ -123,8 +125,22 @@ export default function Home() {
           </div>
         )}
 
-        {/* Step 4: Preview and Batch */}
+        {/* Step 4: AI Auto Correct */}
         {step === 4 && template && students.length > 0 && (
+          <div className="animate-in fade-in slide-in-from-bottom-4">
+            <AutoCorrectStage 
+              students={students}
+              onComplete={(corrected) => {
+                setStudents(corrected);
+                setStep(5);
+              }}
+              onSkip={() => setStep(5)}
+            />
+          </div>
+        )}
+
+        {/* Step 5: Preview and Batch */}
+        {step === 5 && template && students.length > 0 && (
           <div className="space-y-12 animate-in fade-in slide-in-from-bottom-4">
             
             <section className="max-w-5xl mx-auto">
@@ -132,7 +148,7 @@ export default function Home() {
                 
                 {/* Student Selector */}
                 <div className="w-full md:w-1/3 bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex flex-col max-h-[600px]">
-                  <h3 className="font-semibold text-gray-800 mb-4 border-b pb-2">Step 4: Preview</h3>
+                  <h3 className="font-semibold text-gray-800 mb-4 border-b pb-2">Step 5: Preview</h3>
                   <div className="text-sm text-gray-500 mb-4">
                     Select a student to preview how their memento will look.
                   </div>

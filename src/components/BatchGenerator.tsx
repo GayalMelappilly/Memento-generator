@@ -56,7 +56,7 @@ export default function BatchGenerator({ template, layout, students }: Props) {
 
   return (
     <div className="w-full max-w-2xl mx-auto p-6 bg-white rounded-xl shadow-sm border border-gray-100 text-center">
-      <h2 className="text-2xl font-semibold text-gray-800 mb-2">Step 5: Batch Generate</h2>
+      <h2 className="text-2xl font-semibold text-gray-800 mb-2">Step 6: Batch Generate</h2>
       <p className="text-gray-500 mb-8">
         Ready to generate mementos for {students.length} students.
         Files will download sequentially to your default downloads folder.
