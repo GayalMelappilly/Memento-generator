@@ -1,4 +1,20 @@
 import { FaceDetector, FilesetResolver } from "@mediapipe/tasks-vision";
+import { getOpenCV } from "./opencvWasm";
+
+export const PASSPORT_WIDTH = 500;
+export const PASSPORT_HEIGHT = 500;
+export const PASSPORT_ASPECT_RATIO = PASSPORT_WIDTH / PASSPORT_HEIGHT;
+
+export interface Point { x: number; y: number }
+export interface Rect { x: number; y: number; width: number; height: number }
+
+export interface PhotoState {
+  originalSrc: string;
+  status: "pending" | "success" | "needs_corners" | "error";
+  processedSrc: string | null;
+  detectedCorners: Point[] | null;
+  cropBox: Rect | null; // Face crop box on the extracted print
+}
 
 let faceDetector: FaceDetector | null = null;
 
@@ -21,7 +37,7 @@ export async function initFaceDetector() {
   }
 }
 
-function loadImage(src: string): Promise<HTMLImageElement> {
+export function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
@@ -35,114 +51,270 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
-export async function autoCorrectPhoto(src: string): Promise<string> {
-  await initFaceDetector();
-  if (!faceDetector) throw new Error("Face Detector failed to initialize");
-
-  const img = await loadImage(src);
+/**
+ * Ensures points are ordered: top-left, top-right, bottom-right, bottom-left
+ */
+function orderCorners(pts: Point[]): Point[] {
+  const center = pts.reduce((acc, p) => ({ x: acc.x + p.x / 4, y: acc.y + p.y / 4 }), { x: 0, y: 0 });
+  const sorted = [...pts].sort((a, b) => {
+    const angleA = Math.atan2(a.y - center.y, a.x - center.x);
+    const angleB = Math.atan2(b.y - center.y, b.x - center.x);
+    return angleA - angleB;
+  });
+  const tl = pts.find(p => p.x < center.x && p.y < center.y);
+  const tr = pts.find(p => p.x >= center.x && p.y < center.y);
+  const br = pts.find(p => p.x >= center.x && p.y >= center.y);
+  const bl = pts.find(p => p.x < center.x && p.y >= center.y);
   
-  // Downscale image if it's too large to prevent browser freeze
-  const MAX_DIM = 1200;
-  let scale = 1;
-  if (img.width > MAX_DIM || img.height > MAX_DIM) {
-    scale = Math.min(MAX_DIM / img.width, MAX_DIM / img.height);
+  if (tl && tr && br && bl) return [tl, tr, br, bl];
+  return [sorted[0], sorted[1], sorted[2], sorted[3]]; 
+}
+
+/**
+ * Stage 1: Print boundary detection and perspective warp
+ */
+export async function extractPrint(img: HTMLImageElement, overrideCorners?: Point[]): Promise<{ canvas: HTMLCanvasElement | null, corners: Point[] | null }> {
+  const cv = await getOpenCV();
+  
+  let srcMat = cv.imread(img);
+  let outputCanvas = document.createElement("canvas");
+  
+  let corners: Point[] = overrideCorners || [];
+
+  if (corners.length !== 4) {
+    // Auto-detect using Canny Edge
+    let gray = new cv.Mat();
+    cv.cvtColor(srcMat, gray, cv.COLOR_RGBA2GRAY, 0);
+    
+    let blurred = new cv.Mat();
+    cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+    
+    let edges = new cv.Mat();
+    cv.Canny(blurred, edges, 75, 200);
+    
+    let contours = new cv.MatVector();
+    let hierarchy = new cv.Mat();
+    cv.findContours(edges, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+    
+    let maxArea = 0;
+    let bestApprox = new cv.Mat();
+    
+    for (let i = 0; i < contours.size(); ++i) {
+      let cnt = contours.get(i);
+      let area = cv.contourArea(cnt);
+      if (area > (img.width * img.height * 0.1)) {
+        let peri = cv.arcLength(cnt, true);
+        let approx = new cv.Mat();
+        cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+        
+        if (approx.rows === 4 && area > maxArea) {
+          maxArea = area;
+          approx.copyTo(bestApprox);
+        }
+        approx.delete();
+      }
+      cnt.delete();
+    }
+    
+    if (bestApprox.rows === 4) {
+      for (let i = 0; i < 4; i++) {
+        corners.push({ x: bestApprox.data32S[i * 2], y: bestApprox.data32S[i * 2 + 1] });
+      }
+      corners = orderCorners(corners);
+    }
+    
+    gray.delete(); blurred.delete(); edges.delete(); contours.delete(); hierarchy.delete(); bestApprox.delete();
   }
 
-  let canvas = document.createElement("canvas");
-  canvas.width = img.width * scale;
-  canvas.height = img.height * scale;
-  let ctx = canvas.getContext("2d", { willReadFrequently: true })!;
-  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  if (corners.length === 4) {
+    const tl = corners[0]; const tr = corners[1]; const br = corners[2]; const bl = corners[3];
+    
+    const widthA = Math.sqrt(Math.pow(br.x - bl.x, 2) + Math.pow(br.y - bl.y, 2));
+    const widthB = Math.sqrt(Math.pow(tr.x - tl.x, 2) + Math.pow(tr.y - tl.y, 2));
+    const maxWidth = Math.max(Math.floor(widthA), Math.floor(widthB));
+    
+    const heightA = Math.sqrt(Math.pow(tr.x - br.x, 2) + Math.pow(tr.y - br.y, 2));
+    const heightB = Math.sqrt(Math.pow(tl.x - bl.x, 2) + Math.pow(tl.y - bl.y, 2));
+    const maxHeight = Math.max(Math.floor(heightA), Math.floor(heightB));
+    
+    let srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y]);
+    let dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, maxWidth, 0, maxWidth, maxHeight, 0, maxHeight]);
+    
+    let M = cv.getPerspectiveTransform(srcTri, dstTri);
+    let warped = new cv.Mat();
+    let dsize = new cv.Size(maxWidth, maxHeight);
+    cv.warpPerspective(srcMat, warped, M, dsize, cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
+    
+    cv.imshow(outputCanvas, warped);
+    
+    srcTri.delete(); dstTri.delete(); M.delete(); warped.delete(); srcMat.delete();
+    return { canvas: outputCanvas, corners };
+  }
+  
+  srcMat.delete();
+  return { canvas: null, corners: null };
+}
 
-  // STEP 1: Face Detection & Alignment
+/**
+ * Stage 2: Face Detection, Alignment, and Standard Crop
+ */
+export async function alignAndCropFace(canvas: HTMLCanvasElement): Promise<{ canvas: HTMLCanvasElement | null, cropBox: Rect | null }> {
+  await initFaceDetector();
+  if (!faceDetector) throw new Error("Face Detector not ready");
+  
   let detections = faceDetector.detect(canvas);
-  if (detections.detections.length > 0) {
-    const face = detections.detections[0];
-    const keypoints = face.keypoints;
-    if (keypoints && keypoints.length >= 2) {
-      let rightEye = keypoints[0];
-      let leftEye = keypoints[1];
+  if (detections.detections.length === 0) return { canvas: null, cropBox: null };
+  
+  const face = detections.detections[0];
+  const keypoints = face.keypoints;
+  
+  let resultCanvas = canvas;
+  
+  // 1. Align (Rotate)
+  if (keypoints && keypoints.length >= 2) {
+    let rightEye = keypoints[0];
+    let leftEye = keypoints[1];
+    
+    let rx = rightEye.x * canvas.width;
+    let ry = rightEye.y * canvas.height;
+    let lx = leftEye.x * canvas.width;
+    let ly = leftEye.y * canvas.height;
+    
+    let dy = ly - ry;
+    let dx = lx - rx;
+    let angle = Math.atan2(dy, dx) * (180 / Math.PI);
+    
+    if (Math.abs(angle) > 2) {
+      let rotatedCanvas = document.createElement("canvas");
+      rotatedCanvas.width = canvas.width;
+      rotatedCanvas.height = canvas.height;
+      let rotCtx = rotatedCanvas.getContext("2d")!;
+      let cx = canvas.width / 2;
+      let cy = canvas.height / 2;
       
-      let rx = rightEye.x * canvas.width;
-      let ry = rightEye.y * canvas.height;
-      let lx = leftEye.x * canvas.width;
-      let ly = leftEye.y * canvas.height;
-
-      let dy = ly - ry;
-      let dx = lx - rx;
-      let angle = Math.atan2(dy, dx) * (180 / Math.PI);
-
-      if (Math.abs(angle) > 2 && Math.abs(angle) < 45) {
-        let rotatedCanvas = document.createElement("canvas");
-        rotatedCanvas.width = canvas.width;
-        rotatedCanvas.height = canvas.height;
-        let rotCtx = rotatedCanvas.getContext("2d")!;
-        
-        let cx = canvas.width / 2;
-        let cy = canvas.height / 2;
-        
-        rotCtx.translate(cx, cy);
-        rotCtx.rotate(angle * (Math.PI / 180));
-        rotCtx.translate(-cx, -cy);
-        rotCtx.drawImage(canvas, 0, 0);
-        
-        canvas = rotatedCanvas;
-        ctx = rotCtx;
-      }
+      let rad = Math.abs(angle) * (Math.PI / 180);
+      let scale = Math.cos(rad) + Math.sin(rad) * Math.max(canvas.width / canvas.height, canvas.height / canvas.width);
+      
+      rotCtx.translate(cx, cy);
+      rotCtx.rotate(angle * (Math.PI / 180));
+      rotCtx.scale(scale, scale);
+      rotCtx.translate(-cx, -cy);
+      rotCtx.drawImage(canvas, 0, 0);
+      resultCanvas = rotatedCanvas;
+      
+      // Re-detect on rotated canvas
+      detections = faceDetector.detect(resultCanvas);
     }
   }
+  
+  if (detections.detections.length === 0) return { canvas: resultCanvas, cropBox: null };
+  
+  // 2. Compute Crop Box (1:1 Aspect Ratio)
+  const finalFace = detections.detections[0];
+  const bbox = finalFace.boundingBox;
+  if (!bbox) return { canvas: resultCanvas, cropBox: null };
+  
+  // Head is ~60% of the image height.
+  const targetCropHeight = bbox.height / 0.60; 
+  const targetCropWidth = targetCropHeight * PASSPORT_ASPECT_RATIO;
+  
+  const faceCenterX = bbox.originX + bbox.width / 2;
+  const faceCenterY = bbox.originY + bbox.height / 2;
+  
+  let cropX = faceCenterX - targetCropWidth / 2;
+  let cropY = faceCenterY - targetCropHeight * 0.45; // slightly above center vertically
+  
+  const cropBox = { x: cropX, y: cropY, width: targetCropWidth, height: targetCropHeight };
+  
+  // 3. Draw final crop to standardized output
+  let outCanvas = document.createElement("canvas");
+  outCanvas.width = PASSPORT_WIDTH;
+  outCanvas.height = PASSPORT_HEIGHT;
+  let outCtx = outCanvas.getContext("2d")!;
+  
+  outCtx.drawImage(resultCanvas, cropBox.x, cropBox.y, cropBox.width, cropBox.height, 0, 0, PASSPORT_WIDTH, PASSPORT_HEIGHT);
+  
+  return { canvas: outCanvas, cropBox };
+}
 
-  // STEP 2: Smart Face Centering & Crop
-  // Run detection again on straightened image
-  detections = faceDetector.detect(canvas);
-  if (detections.detections.length > 0) {
-    const face = detections.detections[0];
-    const bbox = face.boundingBox;
-    if (bbox) {
-      const targetRatio = 1.0; // 1:1 Aspect Ratio
-      const faceHeight = bbox.height;
-      // Face takes up roughly 50% of the total height, leaving room for hair/head top and neck/shoulders.
-      let cropHeight = faceHeight / 0.50; 
-      let cropWidth = cropHeight * targetRatio;
-
-      const faceCenterX = bbox.originX + bbox.width / 2;
-      const faceCenterY = bbox.originY + bbox.height / 2;
-
-      // Position the crop so the face is slightly above the vertical center (45% down from top)
-      let cropX = faceCenterX - cropWidth / 2;
-      let cropY = faceCenterY - cropHeight * 0.45;
-
-      if (cropX < 0) {
-        cropWidth += cropX * 2;
-        cropX = 0;
-      }
-      if (cropY < 0) {
-        cropHeight += cropY;
-        cropY = 0;
-      }
-      if (cropX + cropWidth > canvas.width) {
-        let diff = (cropX + cropWidth) - canvas.width;
-        cropWidth -= diff * 2;
-        cropX = canvas.width - cropWidth;
-      }
-      if (cropY + cropHeight > canvas.height) {
-        cropHeight = canvas.height - cropY;
-        cropWidth = cropHeight * targetRatio;
-        cropX = faceCenterX - cropWidth / 2;
-      }
-
-      if (cropWidth > 0 && cropHeight > 0) {
-        let finalCanvas = document.createElement("canvas");
-        finalCanvas.width = cropWidth;
-        finalCanvas.height = cropHeight;
-        let finalCtx = finalCanvas.getContext("2d")!;
-        
-        finalCtx.filter = "contrast(1.05) brightness(1.02)";
-        finalCtx.drawImage(canvas, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
-        canvas = finalCanvas;
-      }
-    }
+/**
+ * Stage 3: Histogram Normalization (Brightness/Contrast)
+ */
+export function normalizeBrightness(canvas: HTMLCanvasElement): HTMLCanvasElement {
+  let ctx = canvas.getContext("2d");
+  if (!ctx) return canvas;
+  
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+  
+  let min = 255, max = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const luma = data[i]*0.299 + data[i+1]*0.587 + data[i+2]*0.114;
+    if (luma < min) min = luma;
+    if (luma > max) max = luma;
   }
+  
+  const range = max - min;
+  if (range > 0 && range < 255) {
+    const scale = 255 / range;
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = Math.min(255, Math.max(0, (data[i] - min) * scale));
+      data[i+1] = Math.min(255, Math.max(0, (data[i+1] - min) * scale));
+      data[i+2] = Math.min(255, Math.max(0, (data[i+2] - min) * scale));
+    }
+    ctx.putImageData(imageData, 0, 0);
+  }
+  
+  return canvas;
+}
 
-  return canvas.toDataURL("image/jpeg", 0.95);
+export async function processPhotoPipeline(src: string, overrideCorners?: Point[]): Promise<PhotoState> {
+  const state: PhotoState = {
+    originalSrc: src,
+    status: "pending",
+    processedSrc: null,
+    detectedCorners: null,
+    cropBox: null
+  };
+  
+  try {
+    const img = await loadImage(src);
+    
+    // Stage 1: Try to extract a warped print if corners are found or provided
+    let faceInputCanvas: HTMLCanvasElement;
+    const { canvas: printCanvas, corners } = await extractPrint(img, overrideCorners);
+    
+    if (printCanvas && corners && corners.length === 4) {
+      faceInputCanvas = printCanvas;
+      state.detectedCorners = corners;
+    } else {
+      // If Stage 1 failed (no clear print rectangle found), just proceed to Stage 2 with the original image!
+      const rawCanvas = document.createElement("canvas");
+      rawCanvas.width = img.width;
+      rawCanvas.height = img.height;
+      const ctx = rawCanvas.getContext("2d")!;
+      ctx.drawImage(img, 0, 0);
+      faceInputCanvas = rawCanvas;
+    }
+    
+    // Stage 2: Align face, rotate, and crop to 1:1 ratio
+    const { canvas: faceCanvas, cropBox } = await alignAndCropFace(faceInputCanvas);
+    if (!faceCanvas) {
+      // If Face Detection fails, then we truly need manual intervention
+      state.status = "needs_corners"; 
+      return state;
+    }
+    state.cropBox = cropBox;
+    
+    // Stage 3: Normalize
+    const finalCanvas = normalizeBrightness(faceCanvas);
+    
+    state.processedSrc = finalCanvas.toDataURL("image/jpeg", 0.95);
+    state.status = "success";
+    return state;
+  } catch (err) {
+    console.error("Pipeline error", err);
+    state.status = "error";
+    return state;
+  }
 }

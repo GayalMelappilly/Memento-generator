@@ -1,11 +1,10 @@
-"use client";
-
-import React, { useState, useEffect } from "react";
+import React, { useState } from "react";
 import { Student } from "@/types";
-import { autoCorrectPhoto, initFaceDetector } from "@/lib/photoCorrection";
+import { PhotoState, processPhotoPipeline, initFaceDetector } from "@/lib/photoCorrection";
+import { getOpenCV } from "@/lib/opencvWasm";
+import ReviewGrid from "./ReviewGrid";
 import { Loader2, Wand2, CheckCircle2 } from "lucide-react";
 import { toast } from "sonner";
-import Script from "next/script";
 
 interface Props {
   students: Student[];
@@ -16,64 +15,79 @@ interface Props {
 export default function AutoCorrectStage({ students, onComplete, onSkip }: Props) {
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [isDetectorLoaded, setIsDetectorLoaded] = useState(false);
+  const [photoStates, setPhotoStates] = useState<PhotoState[] | null>(null);
 
   const handleProcess = async () => {
     setIsProcessing(true);
     setProgress(0);
-    let corrected = [...students];
-    let failures = 0;
+    
+    let states: PhotoState[] = [];
 
     try {
-      if (!isDetectorLoaded) {
-        toast.loading("Initializing AI Models...", { id: "init" });
-        await initFaceDetector();
-        setIsDetectorLoaded(true);
-        toast.dismiss("init");
-      }
+      toast.loading("Initializing AI Models (OpenCV & MediaPipe)...", { id: "init" });
+      await Promise.all([
+        initFaceDetector(),
+        getOpenCV()
+      ]);
+      toast.dismiss("init");
 
       for (let i = 0; i < students.length; i++) {
         try {
           const originalSrc = students[i].photo;
           if (originalSrc) {
-            const newSrc = await autoCorrectPhoto(originalSrc);
-            corrected[i] = { ...students[i], photo: newSrc };
+            const state = await processPhotoPipeline(originalSrc);
+            states.push(state);
+          } else {
+            states.push({ originalSrc: "", status: "error", processedSrc: null, cropBox: null, detectedCorners: null });
           }
         } catch (err) {
           console.error(`Failed to correct photo for ${students[i].name}`, err);
-          failures++;
+          states.push({ originalSrc: students[i].photo, status: "error", processedSrc: null, cropBox: null, detectedCorners: null });
         }
         setProgress(i + 1);
         
-        // Yield to the main thread to prevent the page from freezing and allow the UI to update
-        await new Promise(r => setTimeout(r, 100));
+        // Yield to the main thread
+        await new Promise(r => setTimeout(r, 50));
       }
 
-      if (failures > 0) {
-        toast.warning(`${failures} photos could not be fully corrected and were left as-is.`);
-      } else {
-        toast.success("All photos corrected successfully!");
-      }
-
-      onComplete(corrected);
+      setPhotoStates(states);
     } catch (err) {
       console.error(err);
       toast.dismiss("init");
-      toast.error("An error occurred during batch correction.");
+      toast.error("Failed to initialize AI models. Are you offline?");
+    } finally {
       setIsProcessing(false);
     }
   };
 
+  const handleUpdateState = (index: number, newState: PhotoState) => {
+    if (!photoStates) return;
+    const newStates = [...photoStates];
+    newStates[index] = newState;
+    setPhotoStates(newStates);
+  };
+
+  // If we have finished processing (even with errors), show the review grid
+  if (photoStates) {
+    return (
+      <ReviewGrid 
+        students={students} 
+        photoStates={photoStates} 
+        onConfirm={onComplete}
+        onUpdateState={handleUpdateState}
+      />
+    );
+  }
+
   return (
     <div className="w-full max-w-2xl mx-auto p-6 bg-white rounded-xl shadow-sm border border-gray-100 text-center">
-
       <div className="mb-6 flex justify-center text-blue-600">
         <Wand2 className="h-12 w-12" />
       </div>
 
       <h2 className="text-2xl font-semibold text-gray-800 mb-2">Step 4: AI Photo Auto Correction</h2>
       <p className="text-gray-500 mb-8">
-        We detected {students.length} uploaded students. Would you like to automatically straighten, crop, and align all passport photos using AI?
+        We detected {students.length} uploaded students. Would you like to automatically extract the prints, straighten, crop, and align all passport photos using AI?
       </p>
 
       {isProcessing ? (
@@ -99,7 +113,7 @@ export default function AutoCorrectStage({ students, onComplete, onSkip }: Props
             className={`inline-flex items-center justify-center gap-2 px-8 py-3 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition shadow-sm`}
           >
             <CheckCircle2 className="h-5 w-5" />
-            Auto Correct Photos
+            Start Auto Correction
           </button>
           
           <button

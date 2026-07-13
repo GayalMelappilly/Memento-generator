@@ -5,8 +5,9 @@ export const StudentSchema = z.object({
   photo: z.string().optional(),
   "Name of student": z.string().optional(),
   "image": z.string().optional(),
+  "Upload Student Image": z.string().optional(),
 }).transform((data) => {
-  let photoUrl = data.photo || data.image || "";
+  let photoUrl = data.photo || data.image || data["Upload Student Image"] || "";
   
   if (photoUrl.includes("drive.google.com")) {
     const idMatch = photoUrl.match(/[?&]id=([^&]+)/) || photoUrl.match(/\/d\/([a-zA-Z0-9_-]+)/);
@@ -15,12 +16,14 @@ export const StudentSchema = z.object({
     }
   }
 
+  const extractedName = data.name || data["Name of student"] || "";
+
   return {
-    name: data.name || data["Name of student"] || "",
+    name: extractedName.toUpperCase(),
     photo: photoUrl
   };
 }).refine(data => data.name.length > 0 && data.photo.length > 0, {
-  message: "Each record must have a name (or 'Name of student') and a photo (or 'image')"
+  message: "Each record must have a name (or 'Name of student') and a photo (or 'image' or 'Upload Student Image')"
 });
 
 export const DatasetSchema = z.array(StudentSchema).min(1, "Dataset must contain at least one student");
